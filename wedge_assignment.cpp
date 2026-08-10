@@ -34,7 +34,7 @@ int compute_wedge(double x, double y) {
 }
 
 int main(int argc, char* argv[]) {
-    string in_path  = (argc > 1) ? argv[1] : "event000004591-hits.csv";
+    string in_path  = (argc > 1) ? argv[1] : "hits_truth1000.csv";
     string out_path = (argc > 2) ? argv[2] : "volume8_wedge_assignments.csv";
 
     ifstream fin(in_path);
@@ -51,6 +51,14 @@ int main(int argc, char* argv[]) {
         try {
             Hit h;
             getline(ss, tok, ','); h.hit_id    = stoll(tok);
+            getline(ss, tok, ',');
+            getline(ss, tok, ',');
+            getline(ss, tok, ',');
+            getline(ss, tok, ',');
+            getline(ss, tok, ',');
+            getline(ss, tok, ',');
+            getline(ss, tok, ',');
+            getline(ss, tok, ',');
             getline(ss, tok, ','); h.x         = stod(tok);
             getline(ss, tok, ','); h.y         = stod(tok);
             getline(ss, tok, ','); h.z         = stod(tok);

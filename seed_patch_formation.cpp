@@ -31,7 +31,7 @@ struct Hit {
 struct LayerData {
     int         layer_id;
     double      radius;
-    vector<Hit> hits;   
+    vector<Hit> hits;
 };
 
 struct Superpoint {
@@ -46,10 +46,14 @@ struct SeedPatch {
     int                column_index;
     int                patch_in_column;
     bool               is_rectangular;
+    int                corner_code;   // 40=rect, 4=4-sided non-rect, 5=5-sided, etc.
+    Poly               poly;          // parameter-space polygon vertices (z1, zL)
     vector<Superpoint> superpoints;
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
 // Polygon Clipping & Geometry
+// ─────────────────────────────────────────────────────────────────────────────
 Poly clip_hp(const Poly& p, double a, double b, double c) {
     Poly res;
     int n = (int)p.size();
@@ -92,8 +96,14 @@ bool is_axis_aligned_rect(const Poly& p) {
     return true;
 }
 
-// Field Boundaries & Superpoint Search
+// corner_code: 40 = perfect rectangle, N = N-sided polygon otherwise
+int compute_corner_code(const Poly& poly, bool is_rect) {
+    return is_rect ? 40 : (int)poly.size();
+}
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Field Boundaries & Superpoint Search
+// ─────────────────────────────────────────────────────────────────────────────
 struct FieldBounds { double z1_b_mm, zL_b_mm; };
 
 FieldBounds compute_field_bounds(const vector<double>& z_in, const vector<double>& z_out, double r1, double rL) {
@@ -102,10 +112,10 @@ FieldBounds compute_field_bounds(const vector<double>& z_in, const vector<double
         int n = (int)zv.size();
         return pair<double,double>{zv[max(0, (int)(0.01 * n))] / 10.0, zv[min(n - 1, (int)(0.99 * n))] / 10.0};
     };
-    auto [z0_min, z0_max] = get_pct(z_in);
-    auto [zL_min, zL_max] = get_pct(z_out);
+    pair<double,double> z0 = get_pct(z_in);
+    pair<double,double> zL = get_pct(z_out);
     double ratio = r1 / rL;
-    return {(z0_max * 10.0) * (1.0 - ratio) + (zL_max * 10.0) * ratio, zL_max * 10.0};
+    return {(z0.second * 10.0) * (1.0 - ratio) + (zL.second * 10.0) * ratio, zL.second * 10.0};
 }
 
 Superpoint find_rj_sp(const vector<Hit>& hits, double z_target, int N) {
@@ -127,8 +137,9 @@ Superpoint find_spanning_sp(const vector<Hit>& hits, double z_need_min, double z
     return {hits[si].z, hits[ri].z, si, vector<Hit>(hits.begin() + si, hits.begin() + ri + 1)};
 }
 
-
+// ─────────────────────────────────────────────────────────────────────────────
 // Patch Formation
+// ─────────────────────────────────────────────────────────────────────────────
 vector<SeedPatch> form_seed_patches(int wedge_idx, const vector<LayerData>& layers, int N, const FieldBounds& fb, int& global_ctr) {
     vector<SeedPatch> patches;
     int L = (int)layers.size();
@@ -180,7 +191,9 @@ vector<SeedPatch> form_seed_patches(int wedge_idx, const vector<LayerData>& laye
             if (poly.empty()) { flagged = true; break; }
 
             bool is_rect = analytic_rect && is_axis_aligned_rect(poly);
-            patches.push_back({global_ctr++, wedge_idx, col, patch_in_col++, is_rect, sps});
+            int  cc      = compute_corner_code(poly, is_rect);
+
+            patches.push_back({global_ctr++, wedge_idx, col, patch_in_col++, is_rect, cc, poly, sps});
 
             if (is_rect) zL_target = sp_L.z_min - EPS;
             else        { flagged = true; break; }
@@ -191,23 +204,30 @@ vector<SeedPatch> form_seed_patches(int wedge_idx, const vector<LayerData>& laye
     return patches;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Main
+// ─────────────────────────────────────────────────────────────────────────────
 int main(int argc, char* argv[]) {
-    int    N           = (argc > 1) ? atoi(argv[1]) : 16;
-    string input_csv   = (argc > 2) ? argv[2] : "volume8_wedge_assignments.csv";
-    string output_hits = (argc > 3) ? argv[3] : "seedpatch_hits.csv";
+    int    N            = (argc > 1) ? atoi(argv[1]) : 16;
+    string input_csv    = (argc > 2) ? argv[2] : "volume8_wedge_assignments.csv";
+    string output_hits  = (argc > 3) ? argv[3] : "seedpatch_hits.csv";
+    string output_crnrs = (argc > 4) ? argv[4] : "seedpatch_corners.csv";
+
+    typedef map<int, vector<Hit>>  LayerMap;
+    typedef map<int, LayerMap>     RawMap;
 
     ifstream fin(input_csv);
     if (!fin.is_open()) return 1;
     string line; getline(fin, line);
 
-    map<int, map<int, vector<Hit>>> raw;
+    RawMap raw;
     while (getline(fin, line)) {
         if (line.empty()) continue;
         istringstream ss(line);
         string tok;
         try {
             Hit h;
-            getline(ss, tok, ','); h.hit_id      = stoll(tok);
+            getline(ss, tok, ','); h.hit_id    = stoll(tok);
             getline(ss, tok, ','); h.x         = stod(tok);
             getline(ss, tok, ','); h.y         = stod(tok);
             getline(ss, tok, ','); h.z         = stod(tok);
@@ -223,14 +243,17 @@ int main(int argc, char* argv[]) {
     fin.close();
 
     set<int> lids;
-    for (auto& [w, lm] : raw) for (auto& [l, _] : lm) lids.insert(l);
+    for (RawMap::iterator w_it = raw.begin(); w_it != raw.end(); ++w_it)
+        for (LayerMap::iterator l_it = w_it->second.begin(); l_it != w_it->second.end(); ++l_it)
+            lids.insert(l_it->first);
     vector<int> layer_order(lids.begin(), lids.end());
 
-    map<int, pair<double, int>> r_sum;
+    map<int, pair<double,int>> r_sum;
     vector<double> z_in, z_out;
-    for (auto& [w, lm] : raw) {
-        for (auto& [l, hits] : lm) {
-            for (auto& h : hits) {
+    for (RawMap::iterator w_it = raw.begin(); w_it != raw.end(); ++w_it) {
+        for (LayerMap::iterator l_it = w_it->second.begin(); l_it != w_it->second.end(); ++l_it) {
+            int l = l_it->first;
+            for (Hit& h : l_it->second) {
                 r_sum[l].first += h.r; r_sum[l].second++;
                 if (l == layer_order.front()) z_in.push_back(h.z);
                 if (l == layer_order.back())  z_out.push_back(h.z);
@@ -238,15 +261,26 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    FieldBounds fb = compute_field_bounds(z_in, z_out, r_sum[layer_order.front()].first / r_sum[layer_order.front()].second,
-                                                       r_sum[layer_order.back()].first / r_sum[layer_order.back()].second);
+    FieldBounds fb = compute_field_bounds(
+        z_in, z_out,
+        r_sum[layer_order.front()].first / r_sum[layer_order.front()].second,
+        r_sum[layer_order.back()].first  / r_sum[layer_order.back()].second);
 
-    ofstream fout(output_hits);
-    if (!fout.is_open()) return 1;
+    // ── Open output files ─────────────────────────────────────────────────────
+    ofstream fout_hits(output_hits);
+    ofstream fout_crnrs(output_crnrs);
+    if (!fout_hits.is_open() || !fout_crnrs.is_open()) return 1;
 
-    fout << "global_patch_index,wedge_index,column_index,patch_in_column,"
-         << "is_rectangular,layer_id,hit_index_in_sp,hit_id,"
-         << "x_mm,y_mm,z_mm,r_mm,phi_rad,module_id\n" << fixed << setprecision(3);
+    // seedpatch_hits.csv — added corner_code column
+    fout_hits << "global_patch_index,wedge_index,column_index,patch_in_column,"
+              << "is_rectangular,corner_code,layer_id,hit_index_in_sp,hit_id,"
+              << "x_mm,y_mm,z_mm,r_mm,phi_rad,module_id\n"
+              << fixed << setprecision(3);
+
+    // seedpatch_corners.csv — one row per polygon vertex
+    fout_crnrs << "global_patch_index,wedge_index,column_index,patch_in_column,"
+               << "is_rectangular,corner_code,corner_index,z1_mm,zL_mm\n"
+               << fixed << setprecision(3);
 
     int global_ctr = 0;
     for (int w = 0; w < N_WEDGES; w++) {
@@ -261,17 +295,31 @@ int main(int argc, char* argv[]) {
         }
 
         for (auto& sp : form_seed_patches(w, layers, N, fb, global_ctr)) {
+
+            // Write hit rows (with corner_code)
             for (auto& superpoint : sp.superpoints) {
                 for (size_t hi = 0; hi < superpoint.hits.size(); hi++) {
                     const auto& h = superpoint.hits[hi];
-                    fout << sp.global_index << "," << sp.wedge_index << "," << sp.column_index << ","
-                         << sp.patch_in_column << "," << sp.is_rectangular << "," << h.layer_id << ","
-                         << hi << "," << h.hit_id << "," << h.x << "," << h.y << "," << h.z << ","
-                         << h.r << "," << h.phi << "," << h.module_id << "\n";
+                    fout_hits << sp.global_index << "," << sp.wedge_index << ","
+                              << sp.column_index << "," << sp.patch_in_column << ","
+                              << sp.is_rectangular << "," << sp.corner_code << ","
+                              << h.layer_id << "," << hi << "," << h.hit_id << ","
+                              << h.x << "," << h.y << "," << h.z << ","
+                              << h.r << "," << h.phi << "," << h.module_id << "\n";
                 }
+            }
+
+            // Write corner rows (one row per polygon vertex)
+            for (size_t ci = 0; ci < sp.poly.size(); ci++) {
+                fout_crnrs << sp.global_index << "," << sp.wedge_index << ","
+                           << sp.column_index << "," << sp.patch_in_column << ","
+                           << sp.is_rectangular << "," << sp.corner_code << ","
+                           << ci << "," << sp.poly[ci].x << "," << sp.poly[ci].y << "\n";
             }
         }
     }
-    fout.close();
+
+    fout_hits.close();
+    fout_crnrs.close();
     return 0;
 }
