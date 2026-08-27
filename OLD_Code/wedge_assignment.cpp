@@ -34,8 +34,8 @@ int compute_wedge(double x, double y) {
 }
 
 int main(int argc, char* argv[]) {
-    string in_path  = (argc > 1) ? argv[1] : "hits_truth1000.csv";
-    string out_path = (argc > 2) ? argv[2] : "volume8_wedge_assignments.csv";
+    string in_path  = "hits_truth1000.csv";
+    string out_path = "volume8_wedge_assignments.csv";
 
     ifstream fin(in_path);
     if (!fin.is_open()) return 1;

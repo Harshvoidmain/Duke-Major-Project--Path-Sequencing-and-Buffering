@@ -24,6 +24,8 @@ using Poly = vector<Vec2>;
 
 struct Hit {
     long long hit_id;
+    long long particle_id;
+    int       event_id;
     double    x, y, z, r, phi;
     int       volume_id, layer_id, module_id, wedge_index;
 };
@@ -46,14 +48,13 @@ struct SeedPatch {
     int                column_index;
     int                patch_in_column;
     bool               is_rectangular;
-    int                corner_code;   // 40=rect, 4=4-sided non-rect, 5=5-sided, etc.
-    Poly               poly;          // parameter-space polygon vertices (z1, zL)
+    int                corner_code;
+    int                patch_type;         // 0 = Seed Patch (Primary), 1 = Complementary Patch
+    int                n_unique_particles; // distinct particle_ids across all hits
+    Poly               poly;
     vector<Superpoint> superpoints;
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Polygon Clipping & Geometry
-// ─────────────────────────────────────────────────────────────────────────────
 Poly clip_hp(const Poly& p, double a, double b, double c) {
     Poly res;
     int n = (int)p.size();
@@ -96,24 +97,35 @@ bool is_axis_aligned_rect(const Poly& p) {
     return true;
 }
 
-// corner_code: 40 = perfect rectangle, N = N-sided polygon otherwise
+
 int compute_corner_code(const Poly& poly, bool is_rect) {
     return is_rect ? 40 : (int)poly.size();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Field Boundaries & Superpoint Search
-// ─────────────────────────────────────────────────────────────────────────────
+// Count unique particle_ids across all superpoints of a patch
+int count_unique_particles(const vector<Superpoint>& sps) {
+    set<long long> pids;
+    for (auto& sp : sps)
+        for (auto& h : sp.hits)
+            pids.insert(h.particle_id);
+    return (int)pids.size();
+}
+
+
 struct FieldBounds { double z1_b_mm, zL_b_mm; };
 
 FieldBounds compute_field_bounds(const vector<double>& z_in, const vector<double>& z_out, double r1, double rL) {
     auto get_pct = [](vector<double> zv) {
         sort(zv.begin(), zv.end());
         int n = (int)zv.size();
-        return pair<double,double>{zv[max(0, (int)(0.01 * n))] / 10.0, zv[min(n - 1, (int)(0.99 * n))] / 10.0};
+        return pair<double,double>{};
+    };
+    auto get_full_bounds = [](vector<double> zv) {
+        sort(zv.begin(), zv.end());
+        return pair<double,double>{zv.front() / 10.0, zv.back() / 10.0};
     };
     pair<double,double> z0 = get_pct(z_in);
-    pair<double,double> zL = get_pct(z_out);
+    pair<double,double> zL = get_full_bounds(z_out); // Outermost layer bounds extend till the end (not percentile)
     double ratio = r1 / rL;
     return {(z0.second * 10.0) * (1.0 - ratio) + (zL.second * 10.0) * ratio, zL.second * 10.0};
 }
@@ -150,19 +162,19 @@ vector<SeedPatch> form_seed_patches(int wedge_idx, const vector<LayerData>& laye
     for (int l = 0; l < L; l++) alpha[l] = (layers[l].radius - r0) / (rL - r0);
 
     double z1_target = fb.z1_b_mm;
-    int col = 0, patch_in_col = 0;
-    bool flagged = false;
+    int col = 0;
 
-    while (!flagged) {
+    while (true) {                                   
         Superpoint sp1 = find_rj_sp(layers[0].hits, z1_target, N);
-        if (sp1.start_idx < 0) break;
+        if (sp1.start_idx < 0) break;               
 
-        double zL_target = fb.zL_b_mm;
-        patch_in_col = 0;
+        double zL_target  = fb.zL_b_mm;
+        int patch_in_col  = 0;
+        bool is_complementary_needed = false;
 
-        while (!flagged) {
+        while (true) {                               
             Superpoint sp_L = find_rj_sp(layers[L-1].hits, zL_target, N);
-            if (sp_L.start_idx < 0) break;
+            if (sp_L.start_idx < 0) break;          
 
             vector<Superpoint> sps(L);
             sps[0] = sp1; sps[L-1] = sp_L;
@@ -179,25 +191,45 @@ vector<SeedPatch> form_seed_patches(int wedge_idx, const vector<LayerData>& laye
                 sps[l] = sp_l;
             }
 
+        
             vector<pair<double,double>> sp_ranges(L);
             bool valid = true;
             for (int l = 0; l < L; l++) {
                 if (sps[l].start_idx < 0) { valid = false; break; }
                 sp_ranges[l] = {sps[l].z_min, sps[l].z_max};
             }
-            if (!valid) { flagged = true; break; }
-
+            if (!valid)       break;                // data gap — end column
+            
             Poly poly = compute_polygon(sp_ranges, alpha);
-            if (poly.empty()) { flagged = true; break; }
+            if (poly.empty()) break;                // degenerate — end column
 
             bool is_rect = analytic_rect && is_axis_aligned_rect(poly);
             int  cc      = compute_corner_code(poly, is_rect);
+            int  n_pids  = count_unique_particles(sps);
 
-            patches.push_back({global_ctr++, wedge_idx, col, patch_in_col++, is_rect, cc, poly, sps});
+            // Always advance zL before recording
+            zL_target = sp_L.z_min - EPS;
 
-            if (is_rect) zL_target = sp_L.z_min - EPS;
-            else        { flagged = true; break; }
+            if (!is_complementary_needed) {
+                // Seed Patch (Primary)
+                patches.push_back({global_ctr++, wedge_idx, col, patch_in_col++,
+                                   is_rect, cc, 0 /*seed patch*/, n_pids, poly, sps});
+                if (is_rect) {
+                    // If seed patch is a rectangle, we move to the next seed patch (no complementary needed)
+                    is_complementary_needed = false;
+                } else {
+                    // If seed patch is NOT rectangular, we form 1 complementary patch for it
+                    is_complementary_needed = true;
+                }
+            } else {
+                // Complementary Patch
+                patches.push_back({global_ctr++, wedge_idx, col, patch_in_col++,
+                                   is_rect, cc, 1 /*complementary patch*/, n_pids, poly, sps});
+                // After the complementary patch, return to making seed patches
+                is_complementary_needed = false;
+            }
         }
+
         z1_target = sp1.z_min - EPS;
         col++;
     }
@@ -227,14 +259,18 @@ int main(int argc, char* argv[]) {
         string tok;
         try {
             Hit h;
-            getline(ss, tok, ','); h.hit_id    = stoll(tok);
-            getline(ss, tok, ','); h.x         = stod(tok);
-            getline(ss, tok, ','); h.y         = stod(tok);
-            getline(ss, tok, ','); h.z         = stod(tok);
-            getline(ss, tok, ','); h.volume_id = stoi(tok);
-            getline(ss, tok, ','); h.layer_id  = stoi(tok);
-            getline(ss, tok, ','); h.module_id = stoi(tok);
-            getline(ss, tok, ','); h.phi       = stod(tok);
+            // Columns: event_id, particle_id, hit_id, x, y, z,
+            //          volume_id, layer_id, module_id, phi_rad, wedge_index
+            getline(ss, tok, ','); h.event_id    = stoi(tok);
+            getline(ss, tok, ','); h.particle_id = stoll(tok);
+            getline(ss, tok, ','); h.hit_id      = stoll(tok);
+            getline(ss, tok, ','); h.x           = stod(tok);
+            getline(ss, tok, ','); h.y           = stod(tok);
+            getline(ss, tok, ','); h.z           = stod(tok);
+            getline(ss, tok, ','); h.volume_id   = stoi(tok);
+            getline(ss, tok, ','); h.layer_id    = stoi(tok);
+            getline(ss, tok, ','); h.module_id   = stoi(tok);
+            getline(ss, tok, ','); h.phi         = stod(tok);
             getline(ss, tok, ','); h.wedge_index = stoi(tok);
             h.r = sqrt(h.x * h.x + h.y * h.y);
             raw[h.wedge_index][h.layer_id].push_back(h);
@@ -271,16 +307,20 @@ int main(int argc, char* argv[]) {
     ofstream fout_crnrs(output_crnrs);
     if (!fout_hits.is_open() || !fout_crnrs.is_open()) return 1;
 
-    // seedpatch_hits.csv — added corner_code column
+    // seedpatch_hits.csv — matching exact hit column format and precision of volume8_wedge_assignments.csv
     fout_hits << "global_patch_index,wedge_index,column_index,patch_in_column,"
-              << "is_rectangular,corner_code,layer_id,hit_index_in_sp,hit_id,"
-              << "x_mm,y_mm,z_mm,r_mm,phi_rad,module_id\n"
-              << fixed << setprecision(3);
+              << "is_rectangular,corner_code,patch_type,hit_index_in_sp,"
+              << "event_id,particle_id,hit_id,"
+              << "x,y,z,volume_id,layer_id,module_id,phi_rad\n"
+              << fixed << setprecision(6);
 
-    // seedpatch_corners.csv — one row per polygon vertex
+    // seedpatch_corners.csv — one row per patch, corners horizontal + n_unique_particle_ids
+    static const int MAX_CORNERS = 8;
     fout_crnrs << "global_patch_index,wedge_index,column_index,patch_in_column,"
-               << "is_rectangular,corner_code,corner_index,z1_mm,zL_mm\n"
-               << fixed << setprecision(3);
+               << "is_rectangular,corner_code,patch_type,n_corners,n_unique_particle_ids";
+    for (int ci = 0; ci < MAX_CORNERS; ci++)
+        fout_crnrs << ",c" << ci << "_z1_mm,c" << ci << "_zL_mm";
+    fout_crnrs << "\n" << fixed << setprecision(3);
 
     int global_ctr = 0;
     for (int w = 0; w < N_WEDGES; w++) {
@@ -296,26 +336,32 @@ int main(int argc, char* argv[]) {
 
         for (auto& sp : form_seed_patches(w, layers, N, fb, global_ctr)) {
 
-            // Write hit rows (with corner_code)
+            // Hit rows
             for (auto& superpoint : sp.superpoints) {
                 for (size_t hi = 0; hi < superpoint.hits.size(); hi++) {
                     const auto& h = superpoint.hits[hi];
                     fout_hits << sp.global_index << "," << sp.wedge_index << ","
                               << sp.column_index << "," << sp.patch_in_column << ","
                               << sp.is_rectangular << "," << sp.corner_code << ","
-                              << h.layer_id << "," << hi << "," << h.hit_id << ","
+                              << sp.patch_type << "," << hi << ","
+                              << h.event_id << "," << h.particle_id << "," << h.hit_id << ","
                               << h.x << "," << h.y << "," << h.z << ","
-                              << h.r << "," << h.phi << "," << h.module_id << "\n";
+                              << h.volume_id << "," << h.layer_id << "," << h.module_id << ","
+                              << h.phi << "\n";
                 }
             }
 
-            // Write corner rows (one row per polygon vertex)
-            for (size_t ci = 0; ci < sp.poly.size(); ci++) {
-                fout_crnrs << sp.global_index << "," << sp.wedge_index << ","
-                           << sp.column_index << "," << sp.patch_in_column << ","
-                           << sp.is_rectangular << "," << sp.corner_code << ","
-                           << ci << "," << sp.poly[ci].x << "," << sp.poly[ci].y << "\n";
+            // Corner row (one per patch, all corners horizontal + particle count)
+            int n_c = (int)sp.poly.size();
+            fout_crnrs << sp.global_index << "," << sp.wedge_index << ","
+                       << sp.column_index << "," << sp.patch_in_column << ","
+                       << sp.is_rectangular << "," << sp.corner_code << ","
+                       << sp.patch_type << "," << n_c << "," << sp.n_unique_particles;
+            for (int ci = 0; ci < MAX_CORNERS; ci++) {
+                if (ci < n_c) fout_crnrs << "," << sp.poly[ci].x << "," << sp.poly[ci].y;
+                else          fout_crnrs << ",,";
             }
+            fout_crnrs << "\n";
         }
     }
 
