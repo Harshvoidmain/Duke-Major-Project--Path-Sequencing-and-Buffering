@@ -89,8 +89,8 @@ void Compute_Wedges() {
             layer_bounds[i][iLy].layer_index = iLy;  // Current Layer Index
 
             // Calculate the starting and ending wedge boundary in radians
-            float phi_start = i * dphi     - Deflection_Phi[iLy];
-            float phi_end   = (i+1) * dphi + Deflection_Phi[iLy];
+            double phi_start = i * dphi     - Deflection_Phi[iLy];
+            double phi_end   = (i+1) * dphi + Deflection_Phi[iLy];
 
             if(phi_start<0){phi_start  = 2*M_PI  + phi_start;}
             if(phi_end>2*M_PI){phi_end = phi_end - 2*M_PI;}
@@ -220,4 +220,3 @@ int main(){
     Filter_Hits(bounds);
     return 0;
 }
- 
