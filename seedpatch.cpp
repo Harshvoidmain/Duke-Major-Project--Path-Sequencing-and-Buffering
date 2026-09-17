@@ -150,8 +150,8 @@ bool In_Wedge(double phi, double start, double end) {
 //0:event_id,  1:particle_id,  2:hit_id,  3:volume_id,     4:layer_id,  5:module_id,
 //6:x,  7:y,   8:z,  9:tx,    10:ty,     11:tz,  12:tpx,  13:tpy,      14:tpz,  15:weight
 void Filter_Hits(const map<int, pair<double, double>>& field_bounds){
-    ifstream inputfile("hits_truth1000_.csv");
-    ofstream outputfile("filtered_wedge_hits_01.csv");
+    ifstream inputfile("hits_truth1000 (1).csv");
+    ofstream outputfile("filtered_wedge_hits.csv");
 
     if (!inputfile.is_open()) {
         cerr << "Cannot open input file" << "\n";
@@ -171,7 +171,7 @@ void Filter_Hits(const map<int, pair<double, double>>& field_bounds){
         if (stoi(f[3]) != 8) continue; //Select hits with volume ID == 8
 
         int iEvent = stod(f[0]), iLayer = stoi(f[4])/2,   module_id = stoi(f[5]);
-        double x   = stod(f[6]),   y   = stod(f[7]),   z   = stod(f[8]);
+        double x   = stod(f[6]) * 0.1,   y   = stod(f[7]) * 0.1,   z   = stod(f[8]) * 0.1; // mm to cm
         double tpx = stod(f[12]),  tpy = stod(f[13]),  tpz = stod(f[14]);
         long long hit_id = stoll(f[2]),   part_id = stoll(f[1]);
 
@@ -202,6 +202,151 @@ void Filter_Hits(const map<int, pair<double, double>>& field_bounds){
 
 
 
+#include <algorithm>
+#include <array>
+
+const int Hits_Per_Superpoint = 16;
+
+struct SeedHit {
+    long long event, particle_id, hit_id;
+    int layer, wedge_id;
+    long long module_id;
+    double x, y, z, tpx, tpy, tpz, phi; // cm; phi in degrees
+};
+struct Superpoint {
+    vector<SeedHit> hits;
+    double z_min = 0, z_max = 0;
+};
+struct PatchCorner { double z1, z4; };
+
+// The supplied list is sorted by increasing z.
+bool Select_Superpoint(const vector<SeedHit>& hits, double target, Superpoint& sp) {
+    int end = 0;
+    while (end < (int)hits.size() && hits[end].z <= target) ++end;
+    if (end < Hits_Per_Superpoint) return false;
+    sp.hits.assign(hits.begin() + end - Hits_Per_Superpoint, hits.begin() + end);
+    sp.z_min = sp.hits.front().z;
+    sp.z_max = sp.hits.back().z;
+    return true;
+}
+
+// Intersection with a*z1 + b*z4 <= c.
+vector<PatchCorner> Clip_Seed_Patch(const vector<PatchCorner>& polygon,
+                                   double a, double b, double c) {
+    vector<PatchCorner> result;
+    for (size_t i = 0; i < polygon.size(); ++i) {
+        auto p = polygon[i], q = polygon[(i+1) % polygon.size()];
+        double dp = a*p.z1 + b*p.z4 - c, dq = a*q.z1 + b*q.z4 - c;
+        if (dp <= 0) result.push_back(p);
+        if ((dp <= 0) != (dq <= 0)) {
+            double t = dp / (dp-dq);
+            result.push_back({p.z1+t*(q.z1-p.z1), p.z4+t*(q.z4-p.z4)});
+        }
+    }
+    return result;
+}
+
+// Stage 1: ONE first seed patch per event/wedge, starting from high z.
+// Input coordinates must already be cm; no filtering or unit conversion here.
+void Form_Seed_Patches() {
+    ifstream input("filtered_wedge_hits.csv");
+    if (!input.is_open()) {
+        cerr << "Cannot open filtered_wedge_hits.csv\n";
+        return;
+    }
+
+    // Group each event and wedge into separate layer lists.
+    map<pair<long long,int>, array<vector<SeedHit>,nLayers>> groups;
+    string line;
+    getline(input, line); // Skip the CSV header.
+    while (getline(input, line)) {
+        stringstream ss(line);
+        string field;
+        vector<string> f;
+        while (getline(ss, field, ',')) f.push_back(field);
+        if (f.size() != 13) continue;
+
+        SeedHit h;
+        h.event = stoll(f[0]); h.particle_id = stoll(f[1]); h.hit_id = stoll(f[2]);
+        h.layer = stoi(f[3]); h.wedge_id = stoi(f[4]); h.module_id = stoll(f[5]);
+        h.x = stod(f[6]); h.y = stod(f[7]); h.z = stod(f[8]);
+        h.tpx = stod(f[9]); h.tpy = stod(f[10]); h.tpz = stod(f[11]);
+        h.phi = stod(f[12]);
+        if (h.layer < 1 || h.layer >= nLayers) continue;
+        groups[{h.event,h.wedge_id}][h.layer].push_back(h);
+    }
+    input.close();
+
+    ofstream hits_out("seedpatch_hits.csv"), corners_out("seedpatch_corners.csv");
+    if (!hits_out || !corners_out) {
+        cerr << "Cannot create patch output files\n";
+        return;
+    }
+    hits_out << setprecision(17)
+        << "patch_id,event,wedge_id,layer,hit_index,particle_id,hit_id,module_id,"
+           "x_cm,y_cm,z_cm,tpx,tpy,tpz,phi_deg,sp_z_min_cm,sp_z_max_cm\n";
+    corners_out << setprecision(17)
+        << "patch_id,event,wedge_id,corner_index,z1_cm,z4_cm\n";
+    int patch_id = 0, insufficient = 0, empty = 0;
+    for (auto& entry : groups) {
+        auto& layers = entry.second;
+        bool enough = true;
+        for (int layer = 1; layer < nLayers; ++layer) {
+            auto& hits = layers[layer];
+            sort(hits.begin(), hits.end(), [](const SeedHit& a, const SeedHit& b) {
+                return a.z < b.z || (a.z == b.z && a.hit_id < b.hit_id);
+            });
+            if (hits.size() < Hits_Per_Superpoint) enough = false;
+        }
+        if (!enough) { ++insufficient; continue; }
+        Superpoint sp[nLayers];
+        Select_Superpoint(layers[1], layers[1].back().z, sp[1]);
+        Select_Superpoint(layers[4], layers[4].back().z, sp[4]);
+        bool valid = true;
+        for (int layer = 2; layer <= 3; ++layer) {
+            double alpha = (Radius[layer]-Radius[1])/(Radius[4]-Radius[1]);
+            double target = (1-alpha)*sp[1].z_max + alpha*sp[4].z_max;
+            // Right-justify: take the last 16 hits at or below the max-to-max line.
+            if (!Select_Superpoint(layers[layer], target, sp[layer])) valid = false;
+        }
+        if (!valid) { ++insufficient; continue; }
+        vector<PatchCorner> polygon = {
+            {sp[1].z_min,sp[4].z_min}, {sp[1].z_max,sp[4].z_min},
+            {sp[1].z_max,sp[4].z_max}, {sp[1].z_min,sp[4].z_max}
+        };
+        for (int layer = 2; layer <= 3; ++layer) {
+            double alpha = (Radius[layer]-Radius[1])/(Radius[4]-Radius[1]);
+            polygon = Clip_Seed_Patch(polygon, 1-alpha, alpha, sp[layer].z_max);
+            polygon = Clip_Seed_Patch(polygon, alpha-1, -alpha, -sp[layer].z_min);
+        }
+        double area2 = 0;
+        for (size_t i = 0; i < polygon.size(); ++i) {
+            auto p = polygon[i], q = polygon[(i+1)%polygon.size()];
+            area2 += p.z1*q.z4-q.z1*p.z4;
+        }
+        if (polygon.size() < 3 || fabs(area2) <= 1e-12) { ++empty; continue; }
+        for (int layer = 1; layer < nLayers; ++layer) {
+            for (size_t i = 0; i < sp[layer].hits.size(); ++i) {
+                const auto& h = sp[layer].hits[i];
+                hits_out << patch_id << ',' << h.event << ',' << h.wedge_id << ','
+                    << layer << ',' << i << ',' << h.particle_id << ',' << h.hit_id
+                    << ',' << h.module_id << ',' << h.x << ',' << h.y << ',' << h.z
+                    << ',' << h.tpx << ',' << h.tpy << ',' << h.tpz << ',' << h.phi
+                    << ',' << sp[layer].z_min << ',' << sp[layer].z_max << '\n';
+            }
+        }
+        for (size_t i = 0; i < polygon.size(); ++i)
+            corners_out << patch_id << ',' << entry.first.first << ','
+                << entry.first.second << ',' << i << ',' << polygon[i].z1
+                << ',' << polygon[i].z4 << '\n';
+        ++patch_id;
+    }
+    hits_out.close(); corners_out.close();
+    cout << "First seed patches: " << patch_id
+         << "\nInsufficient selectable hits: " << insufficient
+         << "\nEmpty/zero-area patches: " << empty << '\n';
+}
+
 int main(){
     rad2deg = 180.0 / M_PI;
     // Calculate the radius of curvature R
@@ -218,5 +363,8 @@ int main(){
 
     // Data Filtering
     Filter_Hits(bounds);
+
+    //patch formation 
+    Form_Seed_Patches();
     return 0;
 }

@@ -150,7 +150,7 @@ bool In_Wedge(double phi, double start, double end) {
 //0:event_id,  1:particle_id,  2:hit_id,  3:volume_id,     4:layer_id,  5:module_id,
 //6:x,  7:y,   8:z,  9:tx,    10:ty,     11:tz,  12:tpx,  13:tpy,      14:tpz,  15:weight
 void Filter_Hits(const map<int, pair<double, double>>& field_bounds){
-    ifstream inputfile("hits_truth1000_.csv");
+    ifstream inputfile("hits_truth1000.csv");
     ofstream outputfile("filtered_wedge_hits_01.csv");
 
     if (!inputfile.is_open()) {
