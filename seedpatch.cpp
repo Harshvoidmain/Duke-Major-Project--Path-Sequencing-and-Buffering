@@ -338,37 +338,28 @@ void Form_Seed_Patches() {
         << "patch_id,event,wedge_id,corner_index,z1_cm,z4_cm,column_id,patch_in_column,is_rectangle\n";
     
     // Counters used for patch IDs and the final diagnostic summary.
-    int patch_id = 0, insufficient = 0, empty = 0;
-
-    // Process every event/wedge independently.
+    int patch_id = 0, insufficient = 0;
     for (auto& entry : groups) {
         auto& layers = entry.second;
         bool enough = true;
-
-        // Sort each layer from low z to high z. hit_id gives a stable order
-        // when two hits have the same z-coordinate.
+        // Sort each layer from low z to high z.
         for (int layer = 1; layer < nLayers; ++layer) {
             auto& hits = layers[layer];
             sort(hits.begin(), hits.end(), [](const SeedHit& a, const SeedHit& b) {
                 return a.z < b.z || (a.z == b.z && a.hit_id < b.hit_id);
             });
-            // A superpoint requires 16 hits on every detector layer.
             if (hits.size() < Hits_Per_Superpoint) 
                 enough = false;
         }
-
-        // This event/wedge cannot form a seed patch if any layer has <16 hits.
         if (!enough) { ++insufficient; continue; }
 
         Superpoint sp[nLayers];
-
-        // Start at the largest Layer 1 z and move toward smaller z-values.
         // Every selected Layer 1 superpoint defines one patch column.
         double column_target = layers[1].back().z;
         int column_id = 0;
         
         while (Select_Superpoint(layers[1], column_target, sp[1])) {
-            // Keep this Layer 1 superpoint fixed for every patch in the column.
+            // Layer 1 superpoint fixed for every patch in the column.
             // Start the column at the largest available Layer 4 z-value.
             double row_target = layers[4].back().z;
             int patch_in_column = 0;
@@ -377,7 +368,6 @@ void Form_Seed_Patches() {
             // same column while the previous patch remains rectangular.
             while (Select_Superpoint(layers[4], row_target, sp[4])) {
                 bool valid = true;
-
                 // Use the line joining the Layer 1 and Layer 4 z-max values to
                 // find the right-justification target on Layers 2 and 3.
                 for (int layer = 2; layer <= 3; ++layer) {
@@ -386,36 +376,24 @@ void Form_Seed_Patches() {
                     // Right-justify: take the last 16 hits at or below the max-to-max line.
                     if (!Select_Superpoint(layers[layer], target, sp[layer])) valid = false;
                 }
-
                 // Stop this column if either intermediate superpoint cannot
-                // supply 16 hits at or below its calculated target.
                 if (!valid) { ++insufficient; break; }
 
+                
                 // Layers 1 and 4 first define a rectangle in (z1,z4) space.
-                // The four entries are its bottom-left, bottom-right,
-                // top-right and top-left corners.
                 vector<PatchCorner> polygon = {
                     {sp[1].z_min,sp[4].z_min}, {sp[1].z_max,sp[4].z_min},
                     {sp[1].z_max,sp[4].z_max}, {sp[1].z_min,sp[4].z_max}
                 };
-
-                // Each Layer 2 and Layer 3 superpoint defines an allowed strip.
-                // Clip the polygon once at the strip's upper boundary and once
-                // at its lower boundary to obtain the final seed-patch shape.
+                
                 for (int layer = 2; layer <= 3; ++layer) {
                     double alpha = (Radius[layer]-Radius[1])/(Radius[4]-Radius[1]);
                     polygon = Clip_Seed_Patch(polygon, 1-alpha, alpha, sp[layer].z_max);
                     polygon = Clip_Seed_Patch(polygon, alpha-1, -alpha, -sp[layer].z_min);
                 }
 
-                // Use the shoelace formula to calculate twice the polygon area.
-                // Fewer than three corners or zero area means no valid patch.
-                double area2 = 0;
-                for (size_t i = 0; i < polygon.size(); ++i) {
-                    auto p = polygon[i], q = polygon[(i+1)%polygon.size()];
-                    area2 += p.z1*q.z4-q.z1*p.z4;
-                }
-                if (polygon.size() < 3 || fabs(area2) <= 1e-12) { ++empty; break; }
+                // A valid two-dimensional polygon needs at least three corners.
+                if (polygon.size() < 3) break;
 
                 // Determine whether Layers 2 and 3 left the original rectangle
                 // unchanged. This decision controls how tiling continues.
@@ -462,8 +440,7 @@ void Form_Seed_Patches() {
     }
     hits_out.close(); corners_out.close();
     cout << "Seed patches (partial tiling): " << patch_id
-         << "\nInsufficient selectable hits: " << insufficient
-         << "\nEmpty/zero-area patches: " << empty << '\n';
+         << "\nInsufficient selectable hits: " << insufficient << '\n';
 }
 
 int main(){
