@@ -222,39 +222,64 @@ struct PatchCorner { double z1, z4; };
 
 bool Select_Superpoint(const vector<SeedHit>& hits, double target, Superpoint& sp) {
     int end = 0;
-    while (end < (int)hits.size() && hits[end].z <= target) ++end;
-    if (end < Hits_Per_Superpoint) return false;
-    sp.hits.assign(hits.begin() + end - Hits_Per_Superpoint, hits.begin() + end);
+    while (end < (int)hits.size() && hits[end].z <= target) 
+           ++end;
+    if (end < Hits_Per_Superpoint) 
+            return false;
+    sp.hits.assign(hits.begin() + end - Hits_Per_Superpoint, 
+                   hits.begin() + end);
     sp.z_min = sp.hits.front().z;
     sp.z_max = sp.hits.back().z;
     return true;
 }
 
 // Intersection with a*z1 + b*z4 <= c.
-vector<PatchCorner> Clip_Seed_Patch(const vector<PatchCorner>& polygon,
-                                   double a, double b, double c) {
+vector<PatchCorner> Clip_Seed_Patch(
+                    const vector<PatchCorner>& polygon,
+                    double a, double b, double c)
+ {
     vector<PatchCorner> result;
-    for (size_t i = 0; i < polygon.size(); ++i) {
-        auto p = polygon[i], q = polygon[(i+1) % polygon.size()];
-        double dp = a*p.z1 + b*p.z4 - c, dq = a*q.z1 + b*q.z4 - c;
-        if (dp <= 0) result.push_back(p);
+    for (size_t i = 0; i < 
+                polygon.size(); ++i) {
+        auto p = polygon[i], 
+             q = polygon[(i+1) % polygon.size()];
+        double dp = a*p.z1 + b*p.z4 - c, 
+               dq = a*q.z1 + b*q.z4 - c;
+        if (dp <= 0) 
+            result.push_back(p);
         if ((dp <= 0) != (dq <= 0)) {
             double t = dp / (dp-dq);
-            result.push_back({p.z1+t*(q.z1-p.z1), p.z4+t*(q.z4-p.z4)});
+            result.push_back(
+                {p.z1+t*(q.z1-p.z1), 
+                 p.z4+t*(q.z4-p.z4)});
         }
     }
     return result;
 }
 
-// A perfect seed retains the entire Layer 1 / Layer 4 rectangle.
-// Linear strip limits reach their extrema at the rectangle's opposite corners.
 bool Is_Rectangle(const Superpoint sp[]) {
+    // Layers 1 and 4 define the original rectangle. A patch remains rectangular
+    // only when the selected Layer 2 and Layer 3 superpoints contain the full
+    // z-interval required by that rectangle at their respective radii.
     const double tolerance = 1e-10; // cm
-    for (int layer = 2; layer <= 3; ++layer) {
-        double alpha = (Radius[layer]-Radius[1])/(Radius[4]-Radius[1]);
-        double low = (1-alpha)*sp[1].z_min + alpha*sp[4].z_min;
-        double high = (1-alpha)*sp[1].z_max + alpha*sp[4].z_max;
-        if (low < sp[layer].z_min-tolerance || high > sp[layer].z_max+tolerance)
+    for (int layer = 2; 
+        layer <= 3; 
+        ++layer) {
+        // Fractional radial position of this layer between Layers 1 and 4.
+        double alpha = 
+            (Radius[layer]-Radius[1])/
+                    (Radius[4]-Radius[1]);
+
+        // Interpolate the lower and upper rectangle edges at this layer.
+        double low = 
+            (1-alpha)*sp[1].z_min + alpha*sp[4].z_min;
+        double high = 
+            (1-alpha)*sp[1].z_max + alpha*sp[4].z_max;
+
+        // If either edge lies outside this layer's superpoint, clipping has
+        // changed the rectangle into a nonrectangular polygon.
+        if (low < sp[layer].z_min-tolerance || 
+            high > sp[layer].z_max+tolerance)
             return false;
     }
     return true;
@@ -263,6 +288,8 @@ bool Is_Rectangle(const Superpoint sp[]) {
 // Partial seed tiling: move down after rectangles, otherwise start the next column.
 // Input coordinates must already be cm; no filtering or unit conversion here.
 void Form_Seed_Patches() {
+    // The filtering stage has already selected the hits that belong to wedges.
+    // Seed-patch formation therefore starts directly from this filtered file.
     ifstream input("filtered_wedge_hits.csv");
 
     // Group each event and wedge into separate layer lists.
@@ -282,17 +309,23 @@ void Form_Seed_Patches() {
         //f[4]  = "36"                 // wedge_id
         //.......
 
+        // Convert the 13 CSV fields into one SeedHit object.
         SeedHit h;
         h.event = stoll(f[0]); h.particle_id = stoll(f[1]); h.hit_id = stoll(f[2]);
         h.layer = stoi(f[3]); h.wedge_id = stoi(f[4]); h.module_id = stoll(f[5]);
         h.x = stod(f[6]); h.y = stod(f[7]); h.z = stod(f[8]);
         h.tpx = stod(f[9]); h.tpy = stod(f[10]); h.tpz = stod(f[11]);
         h.phi = stod(f[12]);
+        // Ignore rows whose layer number is outside Layers 1 to 4.
         if (h.layer < 1 || h.layer >= nLayers) continue;
+
+        // Store the hit in its event, wedge and layer group.
         groups[{h.event,h.wedge_id}][h.layer].push_back(h);
     }
     input.close();
 
+    // One output stores all 64 selected hits; the other stores the patch
+    // polygon in the (z1,z4) parameter space.
     ofstream hits_out("seedpatch_hits.csv"), corners_out("seedpatch_corners.csv");
     if (!hits_out || !corners_out) {
         cerr << "Cannot create patch output files\n";
@@ -303,50 +336,92 @@ void Form_Seed_Patches() {
            "x_cm,y_cm,z_cm,tpx,tpy,tpz,phi_deg,sp_z_min_cm,sp_z_max_cm,column_id,patch_in_column,is_rectangle\n";
     corners_out << setprecision(17)
         << "patch_id,event,wedge_id,corner_index,z1_cm,z4_cm,column_id,patch_in_column,is_rectangle\n";
+    
+    // Counters used for patch IDs and the final diagnostic summary.
     int patch_id = 0, insufficient = 0, empty = 0;
+
+    // Process every event/wedge independently.
     for (auto& entry : groups) {
         auto& layers = entry.second;
         bool enough = true;
+
+        // Sort each layer from low z to high z. hit_id gives a stable order
+        // when two hits have the same z-coordinate.
         for (int layer = 1; layer < nLayers; ++layer) {
             auto& hits = layers[layer];
             sort(hits.begin(), hits.end(), [](const SeedHit& a, const SeedHit& b) {
                 return a.z < b.z || (a.z == b.z && a.hit_id < b.hit_id);
             });
-            if (hits.size() < Hits_Per_Superpoint) enough = false;
+            // A superpoint requires 16 hits on every detector layer.
+            if (hits.size() < Hits_Per_Superpoint) 
+                enough = false;
         }
+
+        // This event/wedge cannot form a seed patch if any layer has <16 hits.
         if (!enough) { ++insufficient; continue; }
+
         Superpoint sp[nLayers];
+
+        // Start at the largest Layer 1 z and move toward smaller z-values.
+        // Every selected Layer 1 superpoint defines one patch column.
         double column_target = layers[1].back().z;
         int column_id = 0;
+        
         while (Select_Superpoint(layers[1], column_target, sp[1])) {
-            // sp[1] is fixed throughout this inner loop.
+            // Keep this Layer 1 superpoint fixed for every patch in the column.
+            // Start the column at the largest available Layer 4 z-value.
             double row_target = layers[4].back().z;
             int patch_in_column = 0;
+
+            // Move downward through Layer 4 to form successive patches in the
+            // same column while the previous patch remains rectangular.
             while (Select_Superpoint(layers[4], row_target, sp[4])) {
                 bool valid = true;
+
+                // Use the line joining the Layer 1 and Layer 4 z-max values to
+                // find the right-justification target on Layers 2 and 3.
                 for (int layer = 2; layer <= 3; ++layer) {
                     double alpha = (Radius[layer]-Radius[1])/(Radius[4]-Radius[1]);
                     double target = (1-alpha)*sp[1].z_max + alpha*sp[4].z_max;
                     // Right-justify: take the last 16 hits at or below the max-to-max line.
                     if (!Select_Superpoint(layers[layer], target, sp[layer])) valid = false;
                 }
+
+                // Stop this column if either intermediate superpoint cannot
+                // supply 16 hits at or below its calculated target.
                 if (!valid) { ++insufficient; break; }
+
+                // Layers 1 and 4 first define a rectangle in (z1,z4) space.
+                // The four entries are its bottom-left, bottom-right,
+                // top-right and top-left corners.
                 vector<PatchCorner> polygon = {
                     {sp[1].z_min,sp[4].z_min}, {sp[1].z_max,sp[4].z_min},
                     {sp[1].z_max,sp[4].z_max}, {sp[1].z_min,sp[4].z_max}
                 };
+
+                // Each Layer 2 and Layer 3 superpoint defines an allowed strip.
+                // Clip the polygon once at the strip's upper boundary and once
+                // at its lower boundary to obtain the final seed-patch shape.
                 for (int layer = 2; layer <= 3; ++layer) {
                     double alpha = (Radius[layer]-Radius[1])/(Radius[4]-Radius[1]);
                     polygon = Clip_Seed_Patch(polygon, 1-alpha, alpha, sp[layer].z_max);
                     polygon = Clip_Seed_Patch(polygon, alpha-1, -alpha, -sp[layer].z_min);
                 }
+
+                // Use the shoelace formula to calculate twice the polygon area.
+                // Fewer than three corners or zero area means no valid patch.
                 double area2 = 0;
                 for (size_t i = 0; i < polygon.size(); ++i) {
                     auto p = polygon[i], q = polygon[(i+1)%polygon.size()];
                     area2 += p.z1*q.z4-q.z1*p.z4;
                 }
                 if (polygon.size() < 3 || fabs(area2) <= 1e-12) { ++empty; break; }
+
+                // Determine whether Layers 2 and 3 left the original rectangle
+                // unchanged. This decision controls how tiling continues.
                 bool rectangle = Is_Rectangle(sp);
+
+                // Write the 16 selected hits from each of the four layers.
                 for (int layer = 1; layer < nLayers; ++layer) {
                     for (size_t i = 0; i < sp[layer].hits.size(); ++i) {
                         const auto& h = sp[layer].hits[i];
@@ -358,6 +433,8 @@ void Form_Seed_Patches() {
                             << ',' << column_id << ',' << patch_in_column << ',' << rectangle << '\n';
                     }
                 }
+
+                // Write every corner of the clipped parameter-space polygon.
                 for (size_t i = 0; i < polygon.size(); ++i)
                     corners_out << patch_id << ',' << entry.first.first << ','
                         << entry.first.second << ',' << i << ',' << polygon[i].z1
@@ -365,12 +442,19 @@ void Form_Seed_Patches() {
                         << patch_in_column << ',' << rectangle << '\n';
                 ++patch_id;
                 ++patch_in_column;
+
+                // A nonrectangular seed is the final patch in this column,
+                // because its complementary patch is not implemented yet.
                 if (!rectangle) break;
+
                 // For a full rectangle, its bottom is exactly the Layer 4 minimum.
                 // Strict decrease also prevents repeated selections for equal-z hits.
                 if (sp[4].z_min >= sp[4].z_max) break;
                 row_target = sp[4].z_min;
             }
+
+            // After finishing one column, use the current Layer 1 minimum as
+            // the target for the next column to the left.
             if (sp[1].z_min >= sp[1].z_max) break;
             column_target = sp[1].z_min;
             ++column_id;
